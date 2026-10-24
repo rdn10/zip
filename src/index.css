@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+@keyframes ocr-indeterminate {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(420%); }
+}
+
+.ocr-indeterminate-bar {
+  animation: ocr-indeterminate 1.4s ease-in-out infinite;
+}

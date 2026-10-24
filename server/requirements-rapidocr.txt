@@ -1,0 +1,4 @@
+rapidocr>=3.10.0
+onnxruntime
+PyMuPDF
+numpy
