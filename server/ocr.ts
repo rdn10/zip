@@ -3,7 +3,7 @@ import type { RouteRecord, ReviewStatus, Differential, City } from './types.ts';
 import crypto from 'crypto';
 import { PDFParse } from 'pdf-parse';
 import { PDFDocument, degrees } from 'pdf-lib';
-import { extractWithPaddleOCR } from './paddleOcr.ts';
+import { extractWithPaddleOCR, repairUtf8Mojibake } from './paddleOcr.ts';
 import { extractWithRapidOCR } from './rapidOcr.ts';
 
 const OPENAI_ROUTE_SCHEMA = {
@@ -298,7 +298,7 @@ function normalizedVehicleRule(type: string): 'TOCO' | 'MEDIO' | 'VUC' | null {
 }
 
 function getDestinationHintFromFilename(filename: string): string | undefined {
-  const stem = filename.replace(/\.pdf$/i, '').trim();
+  const stem = repairUtf8Mojibake(filename).replace(/\.pdf$/i, '').trim();
   const parts = stem.split(/\s+x\s+|_x_|-x-/i);
   if (parts.length < 2) return undefined;
   const candidate = parts[parts.length - 1]
@@ -307,6 +307,16 @@ function getDestinationHintFromFilename(filename: string): string | undefined {
     .trim()
     .toUpperCase();
   return candidate.length >= 3 ? candidate : undefined;
+}
+
+function normalizeCityIdentity(value: string): string {
+  return value.normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase()
+    .replace(/\b(?:DE|DO|DA|DOS|DAS)\b/g, ' ')
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export function formatCurrencyBRL(value: number | null): string {
@@ -427,16 +437,100 @@ REGRAS DE EXTRAÇÃO:
    - Informe confidence como porcentagem de 0 a 100 (100 = leitura muito segura; 0 = ilegível).
 `; */
 
-      const responseText = JSON.stringify(await extractLocally(fileBuffer, filename));
-      if (!responseText) throw new Error('O serviço de OCR não retornou dados para este PDF.');
-      const parsed = parseExtractionJson(responseText);
+      let parsed: any;
+      try {
+        const responseText = JSON.stringify(await extractLocally(fileBuffer, filename));
+        if (!responseText) throw new Error('O serviço de OCR não retornou dados para este PDF.');
+        parsed = parseExtractionJson(responseText);
+      } catch (primaryError) {
+        const message = primaryError instanceof Error ? primaryError.message : String(primaryError);
+        // Paddle can return a successful but wrongly oriented page that does
+        // not yield route endpoints. RapidOCR checks all four rotations, so
+        // give it a chance before failing the reprocess operation.
+        if (engine !== 'paddle' || !/não identificou origem e destino com segurança|não encontrou valores de veículos legíveis/i.test(message)) {
+          throw primaryError;
+        }
+        console.warn(`[OCR] PaddleOCR não identificou a rota em ${filename}; tentando RapidOCR com correção de orientação.`);
+        parsed = await extractWithRapidOCR(fileBuffer, filename);
+      }
+      // Handwritten tariff totals can be legible to RapidOCR when PaddleOCR
+      // returns an empty or implausibly small value. Use the other local engine
+      // only for incomplete Paddle reads, then merge only independently read
+      // values; never replace a valid primary-engine amount with a guess.
+      if (engine === 'paddle' && parsed.priorityTariffTable === true && Array.isArray(parsed.records)) {
+        const hasUnreadableTotal = parsed.records.some((record: any) => {
+          if (record?.hasFreightBreakdown === true) return false;
+          const raw = typeof record?.totalValueRaw === 'string' ? record.totalValueRaw : '-';
+          const value = typeof record?.numericValue === 'number' ? record.numericValue : parseCurrencyInput(raw).numeric;
+          return value === null || value < 100;
+        });
+        if (hasUnreadableTotal) {
+          try {
+            const secondary = await extractWithRapidOCR(fileBuffer, filename);
+            const recordKey = (record: any) => String(record?.vehicleType || '')
+              .normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toUpperCase();
+            const secondaryByType = new Map<string, any>(
+              (Array.isArray(secondary.records) ? secondary.records : []).map((record: any) => [recordKey(record), record])
+            );
+            const primaryRecords = parsed.records as any[];
+            const primaryTypes = new Set(primaryRecords.map(recordKey));
+            parsed.records = primaryRecords.map(record => {
+              const alternate = secondaryByType.get(recordKey(record));
+              if (!alternate) return record;
+              const primaryValue = typeof record.numericValue === 'number'
+                ? record.numericValue
+                : parseCurrencyInput(record.totalValueRaw).numeric;
+              const alternateRaw = typeof alternate.totalValueRaw === 'string' ? alternate.totalValueRaw : '-';
+              const alternateValue = typeof alternate.numericValue === 'number'
+                ? alternate.numericValue
+                : parseCurrencyInput(alternateRaw).numeric;
+              const improvesTotal = record.hasFreightBreakdown !== true
+                && (primaryValue === null || primaryValue < 100)
+                && alternateValue !== null && alternateValue >= 100;
+              const merged = { ...record };
+              if (improvesTotal) {
+                merged.totalValueRaw = alternateRaw;
+                merged.numericValue = alternateValue;
+                merged.confidence = Math.max(Number(record.confidence) || 0, Number(alternate.confidence) || 0);
+                merged.notes = undefined;
+              }
+              for (const field of ['freightWeightRaw', 'tollRaw'] as const) {
+                if (!merged[field] && typeof alternate[field] === 'string' && alternate[field].trim()) {
+                  merged[field] = alternate[field];
+                }
+              }
+              return merged;
+            });
+            for (const alternate of Array.isArray(secondary.records) ? secondary.records : []) {
+              const raw = typeof alternate.totalValueRaw === 'string' ? alternate.totalValueRaw : '-';
+              const value = typeof alternate.numericValue === 'number' ? alternate.numericValue : parseCurrencyInput(raw).numeric;
+              const hasBreakdown = alternate.hasFreightBreakdown === true
+                && (Boolean(alternate.freightWeightRaw) || Boolean(alternate.tollRaw));
+              if (!primaryTypes.has(recordKey(alternate)) && (hasBreakdown || (value !== null && value >= 100))) {
+                parsed.records.push(alternate);
+              }
+            }
+          } catch (fallbackError) {
+            console.warn('[OCR] RapidOCR não conseguiu complementar valores manuscritos do PaddleOCR:', fallbackError);
+          }
+        }
+      }
       const originCity = typeof parsed.originCity === 'string' ? parsed.originCity.trim().toUpperCase() : '';
       const originState = typeof parsed.originState === 'string' ? parsed.originState.trim().toUpperCase() : '';
       const destinationCity = typeof parsed.destinationCity === 'string' ? parsed.destinationCity.trim().toUpperCase() : '';
       const destinationConfidence = typeof parsed.destinationConfidence === 'number' && Number.isFinite(parsed.destinationConfidence)
         ? Math.round(Math.max(0, Math.min(100, parsed.destinationConfidence)))
         : 0;
-      const destinationHintConflict = Boolean(destinationHint && destinationCity !== destinationHint);
+      const normalizedDestinationHint = destinationHint ? normalizeCityIdentity(destinationHint) : undefined;
+      const normalizedDestinationCity = normalizeCityIdentity(destinationCity);
+      // The filename may contain only the municipality while the printed unit
+      // code resolves to a more specific registered base, e.g. CONTAGEM
+      // (GOLIVE / XPEX). These are consistent hints, not a destination conflict.
+      const destinationMatchesMunicipality = Boolean(normalizedDestinationHint && (
+        normalizedDestinationCity === normalizedDestinationHint
+        || normalizedDestinationCity.startsWith(`${normalizedDestinationHint} `)
+      ));
+      const destinationHintConflict = Boolean(destinationHint && !destinationMatchesMunicipality);
       const records = Array.isArray(parsed.records) ? parsed.records : [];
       if (!originCity || !destinationCity || records.length === 0) {
         const missing = [
@@ -547,22 +641,6 @@ REGRAS DE EXTRAÇÃO:
               hasFreightBreakdown: false
             };
           });
-        for (const [rule, vehicleType] of [['TOCO', 'TOCO CASA'], ['MEDIO', 'MÉDIO (3/4 - CASA)'], ['VUC', 'VUC CASA']] as const) {
-          if (!groupedPriority.has(rule)) {
-            casaPriority.push({
-              vehicleType,
-              totalValueRaw: '-',
-              numericValue: null,
-              freightWeightRaw: null,
-              tollRaw: null,
-              freightWeightValue: null,
-              tollValue: null,
-              hasFreightBreakdown: true,
-              confidence: 0,
-              notes: `Coluna ${vehicleType} não identificada na tabela superior; nenhum valor da linha 3º foi usado.`
-            });
-          }
-        }
         normalizedRecords = [...otherRecords, ...casaPriority, ...thirdRecords];
       }
 

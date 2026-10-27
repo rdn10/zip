@@ -151,7 +151,7 @@ export default function App() {
     setIsEditRouteModalOpen(true);
   };
 
-  const handleSaveRecord = async (recordData: Partial<RouteRecord> & { id?: string }) => {
+  const handleSaveRecord = async (recordData: Partial<RouteRecord> & { id?: string }): Promise<boolean> => {
     try {
       if (recordData.id) {
         // Edit
@@ -160,9 +160,9 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(recordData)
         });
-        if (res.ok) {
-          await fetchData();
-        }
+        if (!res.ok) return false;
+        await fetchData();
+        return true;
       } else {
         // Create
         const res = await fetch('/api/routes', {
@@ -170,12 +170,13 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(recordData)
         });
-        if (res.ok) {
-          await fetchData();
-        }
+        if (!res.ok) return false;
+        await fetchData();
+        return true;
       }
     } catch (err) {
       console.error('Error saving record:', err);
+      return false;
     }
   };
 
@@ -208,18 +209,19 @@ export default function App() {
     }
   };
 
-  const handleBatchApprove = async (ids: string[]) => {
+  const handleBatchApprove = async (ids: string[], updates: Array<{ id: string; updates: Partial<RouteRecord> }> = []): Promise<boolean> => {
     try {
       const res = await fetch('/api/routes/batch-approve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids })
+        body: JSON.stringify({ ids, updates })
       });
-      if (res.ok) {
-        await fetchData();
-      }
+      if (!res.ok) return false;
+      await fetchData();
+      return true;
     } catch (err) {
       console.error('Error approving records:', err);
+      return false;
     }
   };
 
@@ -312,8 +314,6 @@ export default function App() {
             <span className="font-bold text-white uppercase tracking-wider">
               SISTEMA DE GESTÃO DE ROTAS & OCR INTELIGENTE
             </span>
-            <span className="text-neutral-500 font-mono">|</span>
-            <span className="text-neutral-400">1.600 Folhas Manuscritas</span>
           </div>
         </div>
 
@@ -407,16 +407,18 @@ export default function App() {
       <ImportModal
         isOpen={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
-        onImportComplete={async (detectedCity?: string) => {
+        onImportComplete={async (detectedCity?: string, openReview = false) => {
           await fetchData();
           if (detectedCity) {
             setSelectedCityName(detectedCity);
             setActiveTab(detectedCity);
             setViewMode('TABLE_ONLY');
           }
+          if (openReview) {
+            setIsImportModalOpen(false);
+            setIsReviewModalOpen(true);
+          }
         }}
-        autoConfirm={settings.autoConfirmOcr}
-        onToggleAutoConfirm={handleToggleAutoConfirm}
         ocrEngine={settings.ocrEngine || 'paddle'}
         onSetOcrEngine={handleSetOcrEngine}
       />

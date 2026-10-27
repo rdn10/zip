@@ -1,8 +1,31 @@
-# Monfredini Transportes — Guia Rápido
+# Sistema de Rotas e OCR — Guia rápido
 
-## Primeira instalação
+Este sistema organiza rotas e lê folhas de frete em PDF. Siga os passos abaixo para abrir no computador.
 
-Instale Node.js e Python 3.12. Abra o PowerShell na pasta do projeto e rode:
+## O que precisa
+
+- Windows 64 bits
+- Node.js em versão **ZIP/portátil**
+- Python 3.12
+
+**Atenção:** neste computador não podemos instalar o Node.js pelo instalador. Baixe no site oficial do Node.js a opção **Windows Binary (.zip)**, extraia a pasta e use o caminho dessa pasta nos comandos abaixo. Não precisa executar instalador nem ter permissão de administrador.
+
+## Primeira configuração
+
+Abra o PowerShell dentro da pasta do projeto. Primeiro, informe onde você extraiu o Node.js. Troque o caminho de exemplo pelo caminho real da pasta que contém `node.exe`:
+
+```powershell
+$env:Path = "C:\Ferramentas\node-vXX-win-x64;" + $env:Path
+```
+
+Confirme que o Node e o npm estão disponíveis:
+
+```powershell
+node -v
+npm.cmd -v
+```
+
+Instale as dependências do sistema e os dois leitores OCR:
 
 ```powershell
 npm.cmd install
@@ -11,42 +34,37 @@ py -3.12 -m pip install -r server/requirements-paddle.txt
 Copy-Item .env.example .env
 ```
 
-Os dois OCRs são gratuitos e locais. Instale ambos se quiser alternar entre eles.
+A instalação dos leitores e o primeiro carregamento dos modelos podem demorar. Os modelos OCR são baixados automaticamente quando usados pela primeira vez.
 
-## Iniciar o sistema
+## Abrir o sistema
 
-Se o Node estiver nessa pasta portátil, rode este comando em cada nova janela do PowerShell:
-
-```powershell
-$env:Path = "C:\Users\ruan.dias\Downloads\node-v24.22.1-win-x64\node-v24.22.1-win-x64;" + $env:Path
-```
-
-Depois, inicie o sistema:
+Sempre que abrir uma nova janela do PowerShell, configure novamente o caminho do Node ZIP:
 
 ```powershell
+$env:Path = "C:\Ferramentas\node-vXX-win-x64;" + $env:Path
 npm.cmd run dev
 ```
 
-Abra [http://localhost:3000](http://localhost:3000). Para parar o servidor, pressione `Ctrl+C` no PowerShell.
+Abra [http://localhost:3000](http://localhost:3000) no navegador. Deixe a janela do PowerShell aberta enquanto usa o sistema. Para encerrar, volte à janela e pressione `Ctrl+C`.
 
-**Não precisa reinstalar o `archiver` nem rodar `npm install` toda vez.** As dependências são instaladas na primeira configuração. O comando do Node acima só precisa ser repetido se abrir uma nova janela do PowerShell e o Node não estiver no `Path` permanente do Windows.
+Você só precisa executar `npm.cmd install` e instalar os pacotes Python na primeira configuração, ou quando houver uma atualização que peça isso. Para usar o sistema, basta configurar o caminho do Node ZIP e executar `npm.cmd run dev`.
 
-## Ler folhas de frete
+## Importar e conferir um PDF
 
-1. Abra **Importar documentos** e selecione **RapidOCR** ou **PaddleOCR**.
-2. Envie os PDFs e aguarde o processamento.
-3. Abra **Conferência e Revisão de OCR** e confira cidades, siglas, veículos e valores.
-4. Corrija o que for necessário e aprove os registros revisados.
+1. No sistema, abra **Importar documentos** e selecione PaddleOCR ou RapidOCR.
+2. Escolha os PDFs e aguarde a leitura. PDFs grandes ou manuscritos podem levar alguns minutos.
+3. Abra **Conferência e Revisão de OCR** para revisar cidades, códigos, veículos e valores.
+4. Corrija os campos necessários e aprove os registros revisados.
 
-Para perfis CASA, confira frete peso e pedágio. Para terceiros, confira o valor total da linha.
+Confira com atenção os valores manuscritos antes de aprovar. Para perfis CASA, revise frete peso e pedágio; para linhas de terceiros, revise o valor total.
 
 ## Usar em outro computador
 
-Instale Node.js e Python 3.12, copie a pasta do projeto e repita os comandos de **Primeira instalação**. Ajuste o caminho do Node no comando acima para a pasta daquele computador.
+Copie a pasta do projeto e faça a configuração inicial nesse computador também. Cada colega precisa ter Node.js ZIP, Python 3.12 e as dependências instaladas localmente. O caminho da pasta do Node ZIP pode ser diferente em cada computador.
 
-Para levar seus dados, copie também:
+Os dados desta versão ficam nos arquivos locais do computador onde o sistema está rodando. Para transferir os dados, copie também:
 
 - `data/database.json` — cidades, rotas e configurações.
 - `storage/uploads/` — PDFs importados.
 
-Faça uma cópia de segurança antes de transferir. Os modelos OCR podem ser baixados na primeira leitura.
+Feche o sistema antes de copiar esses arquivos e mantenha uma cópia de segurança. Compartilhar uma cópia da pasta não sincroniza automaticamente os dados entre computadores.

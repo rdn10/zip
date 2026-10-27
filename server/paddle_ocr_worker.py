@@ -6,6 +6,14 @@ import sys
 import time
 
 
+def _configure_streams() -> None:
+    """Keep the JSON protocol UTF-8 even when Windows uses a legacy code page."""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def _limit_worker_priority() -> None:
     """Keep OCR below foreground apps so the PC stays usable while it runs."""
     try:
@@ -91,6 +99,7 @@ def read_document(pipeline, input_path: str) -> dict:
 
 
 def main() -> int:
+    _configure_streams()
     cpu_threads = max(1, int(os.environ.get("PADDLEOCR_CPU_THREADS", "2")))
     # Set these before importing Paddle so its math libraries do not start one
     # thread per logical CPU and monopolize the machine during inference.
@@ -127,6 +136,7 @@ def main() -> int:
         # Avoid a Paddle 3.x oneDNN/PIR conversion failure seen on Windows CPU.
         # The plain CPU kernels are a little slower but do not use that path.
         "enable_mkldnn": False,
+        # PaddleOCR's document classifier covers 0, 90, 180 and 270 degrees.
         "use_doc_orientation_classify": True,
         "use_doc_unwarping": False,
         "use_textline_orientation": True,

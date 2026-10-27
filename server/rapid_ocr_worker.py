@@ -124,12 +124,15 @@ def orientation_score(result, context=None):
         1 for hint in route_hints if hint and len(normalize_text(hint)) >= 4
         and normalize_text(hint) in normalized_page
     )
+    route_labels = sum(label in normalized_page for label in ("ORIGEM", "DESTINO"))
     candidates = context.get("cityCandidates", [])
     code_matches = sum(
         1 for city in candidates for code in city.get("codes", [])
         if len(normalize_text(code)) >= 4 and normalize_text(code) in normalized_page
     )
-    return anchors * 5 + confidence - vertical * 3 + route_matches * 7 + min(code_matches, 2) * 2
+    return (anchors * 5 + confidence - vertical * 3 + route_labels * 12
+            + route_matches * 15 + min(code_matches, 2) * 2
+            + tariff_value_count(result) * 8)
 
 
 def tariff_value_count(result):
@@ -180,32 +183,25 @@ for line in sys.stdin:
         document = fitz.open(request["path"])
         pages = []
         for page_index, page in enumerate(document):
-            # Render at moderate resolution to balance handwriting legibility and CPU use.
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.65, 1.65), alpha=False)
-            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if pix.n == 4:
-                image = image[:, :, :3]
-            current = recognize_page(image)
-            # Only spend extra inference passes on pages with little readable text.
-            vertical_ratio = sum(1 for item in current["items"] if item["vertical"]) / max(len(current["items"]), 1)
-            anchors = sum(1 for item in current["items"] if any(word in item["text"].upper() for word in ("ORIGEM", "DESTINO", "FRETE", "PED", "TOTAL", "BITREM", "TOCO", "TRUCK", "CARRETA", "VUC")))
-            selected_rotation = 0
-            if anchors < 2 or vertical_ratio > 0.30:
-                candidates = [current]
-                for rotation in (90, 180, 270):
-                    rotated_page = fitz.open()
-                    rotated_page.insert_pdf(document, from_page=page_index, to_page=page_index)
-                    rotated = rotated_page[0]
-                    rotated.set_rotation(rotation)
-                    rotated_pix = rotated.get_pixmap(matrix=fitz.Matrix(1.65, 1.65), alpha=False)
-                    rotated_image = np.frombuffer(rotated_pix.samples, dtype=np.uint8).reshape(rotated_pix.height, rotated_pix.width, rotated_pix.n)
-                    candidate = recognize_page(rotated_image[:, :, :3] if rotated_pix.n == 4 else rotated_image)
-                    candidates.append({**candidate, "rotation": rotation})
-                    rotated_page.close()
-                context = request.get("context", {})
-                best = max(candidates, key=lambda candidate: orientation_score(candidate, context))
-                current = best
-                selected_rotation = best.get("rotation", 0)
+            context = request.get("context", {})
+            # Never infer orientation from a single first pass. Evaluate the
+            # four absolute directions for every page and keep the strongest
+            # OCR result, including on PDFs with a preexisting /Rotate value.
+            candidates = []
+            for rotation in (0, 90, 180, 270):
+                rotated_page = fitz.open()
+                rotated_page.insert_pdf(document, from_page=page_index, to_page=page_index)
+                rotated = rotated_page[0]
+                rotated.set_rotation(rotation)
+                rotated_pix = rotated.get_pixmap(matrix=fitz.Matrix(1.65, 1.65), alpha=False)
+                rotated_image = np.frombuffer(rotated_pix.samples, dtype=np.uint8).reshape(rotated_pix.height, rotated_pix.width, rotated_pix.n)
+                candidate = recognize_page(rotated_image[:, :, :3] if rotated_pix.n == 4 else rotated_image)
+                candidates.append({**candidate, "rotation": rotation})
+                rotated_page.close()
+            current = max(candidates, key=lambda candidate: orientation_score(candidate, context))
+            selected_rotation = current["rotation"]
+            if selected_rotation != page.rotation:
+                print(f"[RapidOCR] Orientação selecionada: {selected_rotation} graus.", file=sys.stderr, flush=True)
             alternate_items = []
             base_tariff_count = tariff_value_count(current)
             if base_tariff_count < 8:

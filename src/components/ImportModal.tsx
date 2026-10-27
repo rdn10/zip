@@ -17,9 +17,7 @@ import { UploadedDocument } from '../types.js';
 interface ImportModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImportComplete: (detectedCity?: string) => void;
-  autoConfirm: boolean;
-  onToggleAutoConfirm: (val: boolean) => void;
+  onImportComplete: (detectedCity?: string, openReview?: boolean) => void;
   ocrEngine: 'paddle' | 'rapidocr';
   onSetOcrEngine: (engine: 'paddle' | 'rapidocr') => void;
 }
@@ -33,15 +31,16 @@ interface QueuedFile {
   status: 'PENDING' | 'UPLOADING' | 'PROCESSING_OCR' | 'PROCESSING' | 'COMPLETED' | 'DUPLICATE' | 'ERROR';
   recordsCount?: number;
   originCity?: string;
+  durationMs?: number;
   errorMessage?: string;
 }
+
+const HISTORY_PAGE_SIZE = 8;
 
 export const ImportModal: React.FC<ImportModalProps> = ({
   isOpen,
   onClose,
   onImportComplete,
-  autoConfirm,
-  onToggleAutoConfirm,
   ocrEngine,
   onSetOcrEngine
 }) => {
@@ -50,6 +49,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
   const [isProcessingQueue, setIsProcessingQueue] = useState(false);
   const [lastImportedCity, setLastImportedCity] = useState<string | null>(null);
   const [documentHistory, setDocumentHistory] = useState<UploadedDocument[]>([]);
+  const [historyPage, setHistoryPage] = useState(1);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [isGeneratingSample, setIsGeneratingSample] = useState(false);
   const [reprocessError, setReprocessError] = useState<string | null>(null);
@@ -62,6 +62,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
   // Fetch document history on open
   useEffect(() => {
     if (isOpen) {
+      setHistoryPage(1);
       loadHistory();
     }
   }, [isOpen]);
@@ -101,6 +102,16 @@ export const ImportModal: React.FC<ImportModalProps> = ({
     if (!Number.isFinite(start)) return '00:00';
     const seconds = Math.max(0, Math.floor((clockNow - start) / 1000));
     return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+  };
+
+  const formatDuration = (durationMs: number) => {
+    const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m ${String(seconds).padStart(2, '0')}s`;
+    if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+    return `${seconds}s`;
   };
 
   const readableOcrError = (message: string) => /EBUSY|resource busy or locked|unlink/i.test(message)
@@ -167,6 +178,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
 
     try {
     for (const item of pending) {
+      const itemStartedAt = Date.now();
       try {
         // Step 1: Uploading
         setQueuedFiles(prev =>
@@ -256,7 +268,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                     status: 'COMPLETED',
                     progress: 100,
                     originCity: detectedCity,
-                    recordsCount: result?.recordsExtracted || 0
+                    recordsCount: result?.recordsExtracted || 0,
+                    durationMs: Date.now() - itemStartedAt
                   }
                 : f
             )
@@ -266,6 +279,10 @@ export const ImportModal: React.FC<ImportModalProps> = ({
           setQueuedFiles(prev => prev.map(f => f.id === item.id
             ? { ...f, status: 'ERROR', progress: 100, errorMessage: message }
             : f));
+        }
+        if (result?.status && result.status !== 'ERROR') {
+          await refreshHistory(false);
+          setHistoryPage(1);
         }
       } catch (err: any) {
         if (err.name === 'AbortError') {
@@ -285,8 +302,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
       setIsProcessingQueue(false);
       processingStartedAtRef.current = null;
       await loadHistory();
-      // Refresh system data after success, without closing or navigating away from this modal.
-      if (importedCity) await onImportComplete(importedCity);
+      // Refresh routes after the batch, then let the parent open OCR review.
+      if (importedCity) await onImportComplete(importedCity, true);
     }
   };
 
@@ -327,7 +344,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || `Falha ao reprocessar (${res.status})`);
       await loadHistory();
-      onImportComplete();
+      await onImportComplete(undefined, true);
     } catch (err) {
       console.error('Error reprocessing:', err);
       setReprocessError(err instanceof Error ? err.message : 'Falha ao reprocessar documento.');
@@ -348,6 +365,8 @@ export const ImportModal: React.FC<ImportModalProps> = ({
   const completedCount = queuedFiles.filter(f => f.status === 'COMPLETED' || f.status === 'DUPLICATE').length;
   const overallProgress = totalFiles > 0 ? Math.round((completedCount / totalFiles) * 100) : 0;
   const activeQueuedFile = queuedFiles.find(f => f.status === 'PROCESSING_OCR' || f.status === 'UPLOADING');
+  const historyPageCount = Math.max(1, Math.ceil(documentHistory.length / HISTORY_PAGE_SIZE));
+  const visibleHistory = documentHistory.slice((historyPage - 1) * HISTORY_PAGE_SIZE, historyPage * HISTORY_PAGE_SIZE);
 
   if (!isOpen) return null;
 
@@ -383,17 +402,6 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                 <option value="rapidocr">RapidOCR</option>
               </select>
             </label>
-            {/* Auto confirm toggle */}
-            <label className="flex items-center gap-2 cursor-pointer bg-neutral-800/80 px-3 py-1.5 rounded text-xs select-none border border-neutral-700">
-              <input
-                type="checkbox"
-                checked={autoConfirm}
-                onChange={e => onToggleAutoConfirm(e.target.checked)}
-                className="rounded accent-red-600"
-              />
-              <span className="text-neutral-300 font-medium">Aprovação Automática</span>
-            </label>
-
             <button
               onClick={requestClose}
               className="p-1.5 text-neutral-400 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors"
@@ -583,7 +591,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                       )}
                       {item.status === 'COMPLETED' && (
                         <span className="text-[11px] text-emerald-400 font-bold flex items-center gap-1">
-                          <CheckCircle className="w-3.5 h-3.5" /> {item.recordsCount} rotas extraídas
+                          <CheckCircle className="w-3.5 h-3.5" /> {item.recordsCount} rotas extraídas · {item.durationMs != null ? formatDuration(item.durationMs) : 'concluído'}
                         </span>
                       )}
                       {item.status === 'DUPLICATE' && (
@@ -666,7 +674,7 @@ export const ImportModal: React.FC<ImportModalProps> = ({
               </div>
             ) : (
               <div className="rounded-lg border border-neutral-800 bg-neutral-950 divide-y divide-neutral-800/80">
-                {documentHistory.map(doc => (
+                {visibleHistory.map(doc => (
                   <React.Fragment key={doc.id}>
                   <div
                     className="p-3 flex items-center justify-between text-xs hover:bg-neutral-900/60 transition-colors"
@@ -678,6 +686,11 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                         {new Date(doc.uploadedAt).toLocaleDateString('pt-BR')} às{' '}
                         {new Date(doc.uploadedAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
                       </p>
+                      {doc.processingStatus === 'COMPLETED' && doc.processingStartedAt && doc.processedAt && (
+                        <p className="text-[10px] text-emerald-400">
+                          Concluído em {formatDuration(Date.parse(doc.processedAt) - Date.parse(doc.processingStartedAt))}
+                        </p>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-3 shrink-0">
@@ -728,6 +741,31 @@ export const ImportModal: React.FC<ImportModalProps> = ({
                   )}
                   </React.Fragment>
                 ))}
+              </div>
+            )}
+            {!isLoadingHistory && documentHistory.length > HISTORY_PAGE_SIZE && (
+              <div className="flex items-center justify-between gap-3 pt-1 text-[11px] text-neutral-400">
+                <span>
+                  Página {historyPage} de {historyPageCount} · {documentHistory.length} documentos
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setHistoryPage(page => Math.max(1, page - 1))}
+                    disabled={historyPage <= 1}
+                    className="rounded border border-neutral-700 px-2.5 py-1 text-neutral-300 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Anterior
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryPage(page => Math.min(historyPageCount, page + 1))}
+                    disabled={historyPage >= historyPageCount}
+                    className="rounded border border-neutral-700 px-2.5 py-1 text-neutral-300 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Próxima
+                  </button>
+                </div>
               </div>
             )}
           </div>

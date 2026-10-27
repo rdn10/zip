@@ -9,8 +9,12 @@ import {
   AlertCircle,
   CheckCircle2,
   ArrowUpDown,
+  ChevronLeft,
+  ChevronRight,
   MapPin
 } from 'lucide-react';
+
+const TABLES_PER_PAGE = 2;
 
 const normalizeFilterText = (value: unknown): string => String(value ?? '')
   .normalize('NFD')
@@ -64,6 +68,7 @@ export const RouteTable: React.FC<RouteTableProps> = ({
   const [differentialFilter, setDifferentialFilter] = useState<string>('ALL');
   const [sortBy, setSortBy] = useState<'type' | 'value' | 'destination'>('destination');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('asc');
+  const [currentPage, setCurrentPage] = useState(1);
 
   // Only origin cities that actually have routes (or the currently selected city)
   const allOriginCities = useMemo(() => {
@@ -171,12 +176,24 @@ export const RouteTable: React.FC<RouteTableProps> = ({
         if (/3\s*(?:º|°|o)|TERCEIRO/i.test(vehicleType)) return 0;
         return 1;
       };
+      const hasRouteValue = (record: RouteRecord) => {
+        const shownValue = String(record.totalValue ?? '').trim();
+        return shownValue !== '' && shownValue !== '-' && /\d/.test(shownValue);
+      };
+      const comparableValue = (record: RouteRecord) => {
+        if (typeof record.numericValue === 'number' && Number.isFinite(record.numericValue)) return record.numericValue;
+        const normalized = String(record.totalValue ?? '').replace(/[^\d,.-]/g, '').replace(/\./g, '').replace(',', '.');
+        const parsed = Number(normalized);
+        return Number.isFinite(parsed) ? parsed : 0;
+      };
       records.sort((a, b) => {
+        const valuePresenceDifference = Number(hasRouteValue(b)) - Number(hasRouteValue(a));
+        if (valuePresenceDifference !== 0) return valuePresenceDifference;
         const groupDifference = profileGroup(a.vehicleType) - profileGroup(b.vehicleType);
         if (groupDifference !== 0) return groupDifference;
         if (sortBy === 'value') {
-          const valA = a.numericValue || 0;
-          const valB = b.numericValue || 0;
+          const valA = comparableValue(a);
+          const valB = comparableValue(b);
           return sortOrder === 'asc' ? valA - valB : valB - valA;
         }
         return 0;
@@ -198,6 +215,52 @@ export const RouteTable: React.FC<RouteTableProps> = ({
 
     return groups;
   }, [filteredRoutes, sortBy, sortOrder]);
+
+  const pageCount = Math.max(1, Math.ceil(groupedSections.length / TABLES_PER_PAGE));
+  const visiblePage = Math.min(currentPage, pageCount);
+  const visibleSections = groupedSections.slice(
+    (visiblePage - 1) * TABLES_PER_PAGE,
+    visiblePage * TABLES_PER_PAGE
+  );
+
+  React.useEffect(() => {
+    setCurrentPage(1);
+  }, [currentCityName, baseView, searchQuery, differentialFilter]);
+
+  const renderPagination = () => pageCount > 1 ? (
+    <nav
+      aria-label="Paginação das tabelas de rotas"
+      className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2.5 text-xs"
+    >
+      <span className="text-neutral-300">
+        Total: <strong className="text-white">{groupedSections.length} {groupedSections.length === 1 ? 'tabela' : 'tabelas'}</strong>
+        <span className="ml-2 text-neutral-500">
+          · Exibindo {visibleSections.length} nesta página ({(visiblePage - 1) * TABLES_PER_PAGE + 1}–{Math.min(visiblePage * TABLES_PER_PAGE, groupedSections.length)})
+        </span>
+      </span>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setCurrentPage(visiblePage - 1)}
+          disabled={visiblePage <= 1}
+          className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2.5 py-1.5 font-semibold text-neutral-200 transition-colors hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <ChevronLeft className="h-3.5 w-3.5" /> Anterior
+        </button>
+        <span aria-live="polite" className="min-w-20 text-center font-bold text-white">
+          Página {visiblePage} de {pageCount}
+        </span>
+        <button
+          type="button"
+          onClick={() => setCurrentPage(visiblePage + 1)}
+          disabled={visiblePage >= pageCount}
+          className="inline-flex items-center gap-1 rounded border border-neutral-700 px-2.5 py-1.5 font-semibold text-neutral-200 transition-colors hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Próxima <ChevronRight className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    </nav>
+  ) : null;
 
   if (allOriginCities.length === 0 && routes.length === 0) {
     return (
@@ -365,6 +428,7 @@ export const RouteTable: React.FC<RouteTableProps> = ({
             </button>
           </div>
         )}
+        {renderPagination()}
         {groupedSections.length === 0 ? (
           <div className="p-12 text-center bg-neutral-900 rounded-lg border border-neutral-800">
             <AlertCircle className="w-10 h-10 text-neutral-500 mx-auto mb-3" />
@@ -399,7 +463,7 @@ export const RouteTable: React.FC<RouteTableProps> = ({
             </div>
           </div>
         ) : (
-          groupedSections.map(section => (
+          visibleSections.map(section => (
             <div
               key={section.key}
               className="rounded overflow-hidden border border-neutral-700/80 shadow-xl bg-white"

@@ -46,11 +46,11 @@ interface ReviewModalProps {
   isOpen: boolean;
   onClose: () => void;
   records: RouteRecord[];
-  onUpdateRecord: (id: string, updates: Partial<RouteRecord>) => void;
+  onUpdateRecord: (id: string, updates: Partial<RouteRecord>) => void | boolean | Promise<void | boolean>;
   onAddRecord: (record: Partial<RouteRecord>) => Promise<RouteRecord | null>;
   onDeleteRecord: (id: string) => void;
   onBatchDelete: (ids: string[]) => void;
-  onBatchApprove: (ids: string[]) => void;
+  onBatchApprove: (ids: string[], updates?: Array<{ id: string; updates: Partial<RouteRecord> }>) => void | boolean | Promise<void | boolean>;
 }
 
 export const ReviewModal: React.FC<ReviewModalProps> = ({
@@ -82,6 +82,11 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
   const [editDifferential, setEditDifferential] = useState<Differential>('NORMAL');
   const [editStatus, setEditStatus] = useState<ReviewStatus>('REVISADO');
   const [appliedDraft, setAppliedDraft] = useState<Partial<RouteRecord> | null>(null);
+  const [draftTotalValues, setDraftTotalValues] = useState<Record<string, string>>({});
+  const [draftBreakdownValues, setDraftBreakdownValues] = useState<Record<string, Partial<RouteRecord>>>({});
+  const [savingRecord, setSavingRecord] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const skipNextRecordSyncId = React.useRef<string | null>(null);
   const [showAddVehicle, setShowAddVehicle] = useState(false);
   const [newVehicleType, setNewVehicleType] = useState('');
   const [newVehicleValue, setNewVehicleValue] = useState('');
@@ -104,6 +109,13 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
     }
     return true;
   });
+  const filteredRecordGroups = Array.from(filteredRecords.reduce((groups, record) => {
+    const key = record.documentId || record.documentName;
+    const group = groups.get(key) || { key, documentName: record.documentName, records: [] as RouteRecord[] };
+    group.records.push(record);
+    groups.set(key, group);
+    return groups;
+  }, new Map<string, { key: string; documentName: string; records: RouteRecord[] }>()).values());
 
   const selectedRecord = records.find(r => r.id === selectedRecordId) || filteredRecords[0] || null;
   const filteredIds = filteredRecords.map(record => record.id);
@@ -117,6 +129,14 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
     );
   };
 
+  const toggleGroupChecked = (groupIds: string[]) => {
+    const groupIsFullyChecked = groupIds.length > 0 && groupIds.every(id => checkedRecordIds.includes(id));
+    setCheckedRecordIds(current => groupIsFullyChecked
+      ? current.filter(id => !groupIds.includes(id))
+      : Array.from(new Set([...current, ...groupIds]))
+    );
+  };
+
   const toggleRecordChecked = (id: string) => {
     setCheckedRecordIds(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id]);
   };
@@ -124,6 +144,12 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
   // When selected record changes, sync edit form
   React.useEffect(() => {
     if (selectedRecord) {
+      if (skipNextRecordSyncId.current === selectedRecord.id) {
+        skipNextRecordSyncId.current = null;
+        return;
+      }
+      skipNextRecordSyncId.current = null;
+      setSaveError('');
       setSelectedRecordId(selectedRecord.id);
       setEditClient(selectedRecord.client);
       setEditOrigin(selectedRecord.originCity);
@@ -131,18 +157,31 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
       setEditDestination(selectedRecord.destinationCity);
       setEditDestinationCode(selectedRecord.destinationCode);
       setEditVehicleType(selectedRecord.vehicleType);
-      setEditTotalValue(
+      const breakdownDraft = draftBreakdownValues[selectedRecord.id];
+      const savedDraftTotal = draftTotalValues[selectedRecord.id]
+        ?? (typeof breakdownDraft?.totalValue === 'string' ? breakdownDraft.totalValue : undefined);
+      setEditTotalValue(savedDraftTotal ?? (
         selectedRecord.hasFreightBreakdown && selectedRecord.driverPaymentValue != null
           ? `R$ ${selectedRecord.driverPaymentValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
           : selectedRecord.totalValue
-      );
-      setEditReceivableValue(selectedRecord.receivableValue == null
+      ));
+      const savedBreakdown = breakdownDraft;
+      const displayMoney = (value: number | null | undefined) => value == null
+        ? ''
+        : `R$ ${value.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+      setEditReceivableValue(savedBreakdown?.receivableValue !== undefined
+        ? displayMoney(savedBreakdown.receivableValue)
+        : selectedRecord.receivableValue == null
         ? ''
         : `R$ ${selectedRecord.receivableValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
-      setEditFreightWeightValue(selectedRecord.freightWeightValue == null
+      setEditFreightWeightValue(savedBreakdown?.freightWeightValue !== undefined
+        ? displayMoney(savedBreakdown.freightWeightValue)
+        : selectedRecord.freightWeightValue == null
         ? ''
         : `R$ ${selectedRecord.freightWeightValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
-      setEditTollValue(selectedRecord.tollValue == null
+      setEditTollValue(savedBreakdown?.tollValue !== undefined
+        ? displayMoney(savedBreakdown.tollValue)
+        : selectedRecord.tollValue == null
         ? ''
         : `R$ ${selectedRecord.tollValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
       setEditDifferential(selectedRecord.differential);
@@ -154,9 +193,9 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
         destinationCity: selectedRecord.destinationCity,
         destinationCode: selectedRecord.destinationCode,
         vehicleType: selectedRecord.vehicleType,
-        totalValue: selectedRecord.hasFreightBreakdown && selectedRecord.driverPaymentValue != null
+        totalValue: savedDraftTotal ?? (selectedRecord.hasFreightBreakdown && selectedRecord.driverPaymentValue != null
           ? formatBrlAmount(selectedRecord.driverPaymentValue)
-          : selectedRecord.totalValue,
+          : selectedRecord.totalValue),
         differential: selectedRecord.differential
       });
     }
@@ -171,30 +210,81 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
     setCheckedRecordIds([]);
   }, [filterStatus, search]);
 
-  const handleSaveSelected = () => {
-    if (!selectedRecord) return;
+  const handleSaveSelected = async (overrides: Partial<RouteRecord> = {}) => {
+    if (!selectedRecord || savingRecord) return;
+    const totalValue = typeof overrides.totalValue === 'string' ? overrides.totalValue : editTotalValue;
+    const parsedTotalValue = parseBrlAmount(totalValue);
     const freightWeight = parseBrlAmount(editFreightWeightValue);
     const toll = parseBrlAmount(editTollValue);
     const manualReceivable = freightWeight != null && toll != null
       ? (Math.round(freightWeight * 100) + Math.round(toll * 100)) / 100
       : parseBrlAmount(editReceivableValue);
-    onUpdateRecord(selectedRecord.id, {
-      client: editClient,
-      originCity: editOrigin.toUpperCase().trim(),
-      originCode: editOriginCode.toUpperCase().trim(),
-      destinationCity: editDestination.toUpperCase().trim(),
-      destinationCode: editDestinationCode.toUpperCase().trim(),
-      vehicleType: editVehicleType,
-      totalValue: editTotalValue,
-      ...(selectedRecord.hasFreightBreakdown ? {
-        freightWeightValue: freightWeight,
-        tollValue: toll,
-        receivableValue: manualReceivable,
-        hasFreightBreakdown: true
-      } : {}),
-      differential: editDifferential,
-      reviewStatus: 'REVISADO'
-    });
+    const existingPaymentCents = selectedRecord.driverPaymentValue == null
+      ? null
+      : Math.round(selectedRecord.driverPaymentValue * 100);
+    const enteredPaymentCents = parsedTotalValue == null ? null : Math.round(parsedTotalValue * 100);
+    const manualDriverPayment = selectedRecord.hasFreightBreakdown && existingPaymentCents !== enteredPaymentCents;
+    setSavingRecord(true);
+    setSaveError('');
+    try {
+      const saved = await onUpdateRecord(selectedRecord.id, {
+        client: editClient,
+        originCity: editOrigin.toUpperCase().trim(),
+        originCode: editOriginCode.toUpperCase().trim(),
+        destinationCity: editDestination.toUpperCase().trim(),
+        destinationCode: editDestinationCode.toUpperCase().trim(),
+        vehicleType: editVehicleType,
+        totalValue,
+        ...(selectedRecord.hasFreightBreakdown ? {
+          freightWeightValue: freightWeight,
+          tollValue: toll,
+          receivableValue: manualReceivable,
+          hasFreightBreakdown: true,
+          ...(manualDriverPayment ? { driverPaymentValue: parsedTotalValue } : {})
+        } : {}),
+        differential: editDifferential,
+        reviewStatus: 'REVISADO',
+        ...overrides
+      });
+      if (saved === false) setSaveError('Não foi possível salvar. Confira a conexão e tente novamente.');
+      else {
+        setDraftTotalValues(current => {
+          const next = { ...current };
+          delete next[selectedRecord.id];
+          return next;
+        });
+        setDraftBreakdownValues(current => {
+          const next = { ...current };
+          delete next[selectedRecord.id];
+          return next;
+        });
+      }
+    } catch {
+      setSaveError('Erro ao salvar. Confira a conexão e tente novamente.');
+    } finally {
+      setSavingRecord(false);
+    }
+  };
+
+  const handleDifferentialChange = async (differential: Differential) => {
+    setEditDifferential(differential);
+    if (!selectedRecord || selectedRecord.differential === differential || savingRecord) return;
+
+    setSavingRecord(true);
+    setSaveError('');
+    skipNextRecordSyncId.current = selectedRecord.id;
+    try {
+      const saved = await onUpdateRecord(selectedRecord.id, { differential });
+      if (saved === false) {
+        skipNextRecordSyncId.current = null;
+        setSaveError('Não foi possível salvar o diferencial. Confira a conexão e tente novamente.');
+      }
+    } catch {
+      skipNextRecordSyncId.current = null;
+      setSaveError('Erro ao salvar o diferencial. Confira a conexão e tente novamente.');
+    } finally {
+      setSavingRecord(false);
+    }
   };
 
   const handleApproveAllPending = () => {
@@ -202,7 +292,60 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
       .filter(r => r.reviewStatus === 'AGUARDANDO CONFERÊNCIA')
       .map(r => r.id);
     if (pendingIds.length > 0) {
-      onBatchApprove(pendingIds);
+      void handleApproveRecords(pendingIds);
+    }
+  };
+
+  const handleApproveRecords = async (ids: string[]) => {
+    if (ids.length === 0 || savingRecord) return;
+    const updates = ids.flatMap(id => {
+      const totalValue = draftTotalValues[id];
+      const record = records.find(item => item.id === id);
+      if (!record) return [];
+      const breakdown = draftBreakdownValues[id];
+      if (totalValue === undefined && !breakdown) return [];
+      const amount = parseBrlAmount(totalValue ?? String(breakdown?.totalValue ?? ''));
+      const normalizedValue = amount == null ? (totalValue ?? String(breakdown?.totalValue ?? '-')) : formatBrlAmount(amount);
+      return [{
+        id,
+        updates: {
+          totalValue: normalizedValue,
+          ...(record.hasFreightBreakdown ? {
+            ...(breakdown || totalValue !== undefined ? {
+              freightWeightValue: breakdown?.freightWeightValue !== undefined ? breakdown.freightWeightValue : record.freightWeightValue,
+              tollValue: breakdown?.tollValue !== undefined ? breakdown.tollValue : record.tollValue,
+              receivableValue: breakdown?.receivableValue !== undefined ? breakdown.receivableValue : record.receivableValue,
+              driverPaymentValue: totalValue !== undefined ? amount : breakdown?.driverPaymentValue ?? null,
+              hasFreightBreakdown: true
+            } : { driverPaymentValue: amount })
+          } : {})
+        }
+      }];
+    });
+
+    setSavingRecord(true);
+    setSaveError('');
+    try {
+      const approved = await onBatchApprove(ids, updates);
+      if (approved === false) {
+        setSaveError('Não foi possível aprovar as rotas. Confira a conexão e tente novamente.');
+        return;
+      }
+      setDraftTotalValues(current => {
+        const next = { ...current };
+        ids.forEach(id => delete next[id]);
+        return next;
+      });
+      setDraftBreakdownValues(current => {
+        const next = { ...current };
+        ids.forEach(id => delete next[id]);
+        return next;
+      });
+      setAppliedDraft(null);
+    } catch {
+      setSaveError('Erro ao aprovar as rotas. Confira a conexão e tente novamente.');
+    } finally {
+      setSavingRecord(false);
     }
   };
 
@@ -216,17 +359,41 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
   const calculatedDriverPayment = manualReceivable != null && paymentPercent != null
     ? Math.floor((Math.round(manualReceivable * 100) * (100 - paymentPercent) + 50) / 100) / 100
     : null;
+  const calculationRuleMessage = paymentPercent == null
+    ? 'Cálculo: origem SP aplica 10% de desconto (pagamento de 90%); outras UFs aplicam 20% (pagamento de 80%). A UF desta rota ainda não foi identificada.'
+    : `Cálculo: origem SP aplica 10% de desconto (pagamento de 90%); outras UFs aplicam 20% (pagamento de 80%). Nesta rota, está aplicado o desconto de ${paymentPercent}%.`;
 
   const handleReceivableChange = (value: string) => {
     const formattedValue = formatBrlInput(value);
     setEditReceivableValue(formattedValue);
     const amount = parseBrlAmount(formattedValue);
+    const paymentCents = amount != null && paymentPercent != null
+      ? Math.floor((Math.round(amount * 100) * (100 - paymentPercent) + 50) / 100)
+      : null;
+    const paymentValue = paymentCents == null ? null : paymentCents / 100;
+    const paymentDisplay = paymentValue == null ? '-' : formatBrlAmount(paymentValue);
+    applyCurrentDraft({ totalValue: paymentDisplay });
+    if (selectedRecord) {
+      setDraftTotalValues(current => {
+        const next = { ...current };
+        delete next[selectedRecord.id];
+        return next;
+      });
+      setDraftBreakdownValues(current => ({
+        ...current,
+        [selectedRecord.id]: {
+          ...current[selectedRecord.id],
+          receivableValue: amount,
+          driverPaymentValue: paymentValue,
+          totalValue: paymentDisplay
+        }
+      }));
+    }
     if (amount == null) {
       if (!value.trim()) setEditTotalValue('-');
       return;
     }
     if (paymentPercent == null) return;
-    const paymentCents = Math.floor((Math.round(amount * 100) * (100 - paymentPercent) + 50) / 100);
     setEditTotalValue(formatBrlAmount(paymentCents / 100));
   };
 
@@ -247,18 +414,43 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
 
     const parsedFreight = parseBrlAmount(nextFreight);
     const parsedToll = parseBrlAmount(nextToll);
+    const receivedCents = parsedFreight != null && parsedToll != null
+      ? Math.round(parsedFreight * 100) + Math.round(parsedToll * 100)
+      : null;
+    const received = receivedCents == null ? null : receivedCents / 100;
+    const paymentCents = receivedCents != null && paymentPercent != null
+      ? Math.floor((receivedCents * (100 - paymentPercent) + 50) / 100)
+      : null;
+    const paymentValue = paymentCents == null ? null : paymentCents / 100;
+    const paymentDisplay = paymentValue == null ? '-' : formatBrlAmount(paymentValue);
+    applyCurrentDraft({ totalValue: paymentDisplay });
+    if (selectedRecord) {
+      setDraftTotalValues(current => {
+        const next = { ...current };
+        delete next[selectedRecord.id];
+        return next;
+      });
+      setDraftBreakdownValues(current => ({
+        ...current,
+        [selectedRecord.id]: {
+          ...current[selectedRecord.id],
+          freightWeightValue: parsedFreight,
+          tollValue: parsedToll,
+          receivableValue: received,
+          driverPaymentValue: paymentValue,
+          totalValue: paymentDisplay
+        }
+      }));
+    }
     if (parsedFreight == null || parsedToll == null) {
       setEditReceivableValue('');
       setEditTotalValue('-');
       return;
     }
 
-    const receivedCents = Math.round(parsedFreight * 100) + Math.round(parsedToll * 100);
-    const received = receivedCents / 100;
     setEditReceivableValue(formatBrlAmount(received));
     if (paymentPercent == null) return;
-    const paymentCents = Math.floor((receivedCents * (100 - paymentPercent) + 50) / 100);
-    setEditTotalValue(formatBrlAmount(paymentCents / 100));
+    setEditTotalValue(paymentDisplay);
   };
 
   const handleTotalValueKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -268,6 +460,9 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
     const appliedValue = amount != null ? formatBrlAmount(amount) : editTotalValue;
     if (amount != null) setEditTotalValue(appliedValue);
     applyCurrentDraft({ totalValue: appliedValue });
+    if (selectedRecord) {
+      setDraftTotalValues(current => ({ ...current, [selectedRecord.id]: appliedValue }));
+    }
     event.currentTarget.blur();
   };
 
@@ -319,6 +514,9 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
         destinationCode: selectedRecord.destinationCode,
         vehicleType: newVehicleType.trim().toUpperCase(),
         totalValue: newVehicleValue.trim() || '-',
+        // CASA profiles use the freight-weight + toll calculator, including
+        // vehicle types added manually during OCR review (such as VUC CASA).
+        hasFreightBreakdown: /\bCASA\b/i.test(newVehicleType),
         differential: selectedRecord.differential,
         reviewStatus: 'AGUARDANDO CONFERÊNCIA',
         ocrConfidence: 0,
@@ -428,8 +626,8 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
                   Selecionar todos ({filteredRecords.length})
                 </label>
                 <button
-                  onClick={() => onBatchApprove(visibleCheckedRecordIds)}
-                  disabled={visibleCheckedRecordIds.length === 0}
+                  onClick={() => { void handleApproveRecords(visibleCheckedRecordIds); }}
+                  disabled={visibleCheckedRecordIds.length === 0 || savingRecord}
                   className="inline-flex items-center gap-1.5 rounded bg-emerald-700 px-2.5 py-1.5 font-bold text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <CheckCheck className="h-3.5 w-3.5" />
@@ -450,92 +648,134 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
                 Nenhum registro encontrado para este filtro.
               </div>
             ) : (
-              filteredRecords.map(rec => {
-                const isSelected = selectedRecord?.id === rec.id;
-                const isPending = rec.reviewStatus === 'AGUARDANDO CONFERÊNCIA';
-                const shownOrigin = isSelected ? appliedDraft?.originCity ?? rec.originCity : rec.originCity;
-                const shownDestination = isSelected ? appliedDraft?.destinationCity ?? rec.destinationCity : rec.destinationCity;
-                const shownVehicleType = isSelected ? appliedDraft?.vehicleType ?? rec.vehicleType : rec.vehicleType;
-                const shownTotalValue = isSelected ? appliedDraft?.totalValue ?? rec.totalValue : rec.totalValue;
-
-                return (
-                  <div
-                    key={rec.id}
-                    onClick={() => setSelectedRecordId(rec.id)}
-                    className={`border-b border-neutral-800/80 p-3.5 cursor-pointer transition-colors flex items-start justify-between gap-3 text-xs ${
-                      isSelected
-                        ? 'bg-neutral-800/90 border-l-4 border-l-red-600'
-                        : isPending
-                        ? 'hover:bg-neutral-900 border-l-4 border-l-amber-500'
-                        : 'hover:bg-neutral-900/60'
-                    }`}
-                  >
-                    <div className="flex min-w-0 items-start gap-2.5">
-                      <input
-                        type="checkbox"
-                        checked={checkedRecordIds.includes(rec.id)}
-                        onClick={event => event.stopPropagation()}
-                        onChange={() => toggleRecordChecked(rec.id)}
-                        className="mt-0.5 h-4 w-4 shrink-0 accent-red-600"
-                        aria-label={`Selecionar rota ${rec.originCity} para ${rec.destinationCity}, ${rec.vehicleType}`}
-                      />
-                      <div className="min-w-0 space-y-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-extrabold text-white uppercase">
-                          {shownOrigin} → {shownDestination}
-                        </span>
-                        <span className="px-1.5 py-0.2 bg-neutral-800 text-neutral-300 font-mono text-[10px] rounded font-bold">
-                          {rec.destinationCode}
-                        </span>
-                        {rec.differential !== 'NORMAL' && rec.differential !== '-' && (
-                          <span className="px-1.5 py-0.2 bg-red-950 text-red-400 border border-red-800 text-[10px] rounded font-bold">
-                            {rec.differential}
-                          </span>
-                        )}
+              filteredRecordGroups.map((group, groupIndex) => (
+                <section key={group.key}>
+                  <div className="border-y-2 border-amber-400/70 border-l-4 border-l-amber-400 bg-amber-950/65 px-3 py-3 sm:px-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 space-y-1.5">
+                        <p className="text-[11px] font-extrabold uppercase tracking-wider text-amber-300 sm:text-xs">
+                          ↓ A PARTIR DAQUI, ROTAS:
+                        </p>
+                        <p className="truncate text-sm font-black uppercase leading-tight text-white sm:text-base">
+                          {Array.from(new Set(group.records.map(record => `${record.originCity} × ${record.destinationCity}`))).join(' · ')}
+                        </p>
                       </div>
-
-                      <div className="flex items-center gap-3 text-[11px] text-neutral-400">
-                        <span className="font-semibold text-neutral-200">{shownVehicleType}</span>
-                        <span>·</span>
-                        <span className="font-mono text-white font-bold">{shownTotalValue}</span>
-                      </div>
-
-                      <p className="text-[10px] text-neutral-400 truncate flex items-center gap-1">
-                        <FileText className="w-3 h-3 text-neutral-400" />
-                        {rec.documentName} (Pág. {rec.pageNumber})
-                      </p>
+                      <div className="flex shrink-0 flex-col items-end gap-1.5">
+                        <span className="rounded bg-neutral-900/80 px-2.5 py-1 text-[10px] font-bold text-neutral-200 sm:text-xs">
+                          {group.records.length} {group.records.length === 1 ? 'rota' : 'rotas'}
+                        </span>
+                        <label
+                          className="flex cursor-pointer items-center gap-1.5 rounded border border-amber-700/70 bg-neutral-950/70 px-2 py-1 text-[10px] font-bold text-amber-100 hover:bg-amber-900/50"
+                          title="Selecionar ou desmarcar todas as revisões deste título"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={group.records.length > 0 && group.records.every(record => checkedRecordIds.includes(record.id))}
+                            onClick={event => event.stopPropagation()}
+                            onChange={() => toggleGroupChecked(group.records.map(record => record.id))}
+                            className="h-3.5 w-3.5 accent-amber-500"
+                            aria-label={`Selecionar todas as revisões de ${Array.from(new Set(group.records.map(record => `${record.originCity} para ${record.destinationCity}`))).join(', ')}`}
+                          />
+                          Selecionar este título
+                        </label>
                       </div>
                     </div>
-
-                    <div className="flex flex-col items-end gap-1.5 shrink-0">
-                      {/* Confidence Meter */}
-                      <span
-                        className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
-                          rec.ocrConfidence >= 90
-                            ? 'bg-emerald-950 text-emerald-400'
-                            : rec.ocrConfidence >= 80
-                            ? 'bg-amber-950 text-amber-400'
-                            : 'bg-red-950 text-red-400'
-                        }`}
-                      >
-                        {rec.ocrConfidence}% OCR
-                      </span>
-
-                      <span
-                        className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
-                          rec.reviewStatus === 'REVISADO'
-                            ? 'bg-emerald-900/60 text-emerald-300'
-                            : rec.reviewStatus === 'AGUARDANDO CONFERÊNCIA'
-                            ? 'bg-amber-900/60 text-amber-300'
-                            : 'bg-neutral-800 text-neutral-300'
-                        }`}
-                      >
-                        {rec.reviewStatus}
-                      </span>
+                    <div className="mt-2 flex min-w-0 items-center gap-1.5 border-t border-amber-700/50 pt-2 text-[10px] font-semibold text-amber-100 sm:text-[11px]">
+                      <FileText className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                      <span className="shrink-0 uppercase tracking-wide">PDF {groupIndex + 1}</span>
+                      <span className="text-amber-500/70">·</span>
+                      <span className="truncate">{group.documentName}</span>
                     </div>
                   </div>
-                );
-              })
+                  {group.records.map(rec => {
+                    const isSelected = selectedRecord?.id === rec.id;
+                    const isPending = rec.reviewStatus === 'AGUARDANDO CONFERÊNCIA';
+                    const shownOrigin = isSelected ? appliedDraft?.originCity ?? rec.originCity : rec.originCity;
+                    const shownDestination = isSelected ? appliedDraft?.destinationCity ?? rec.destinationCity : rec.destinationCity;
+                    const shownVehicleType = isSelected ? appliedDraft?.vehicleType ?? rec.vehicleType : rec.vehicleType;
+                    const shownTotalValue = isSelected
+                      ? appliedDraft?.totalValue ?? draftTotalValues[rec.id] ?? draftBreakdownValues[rec.id]?.totalValue ?? rec.totalValue
+                      : draftTotalValues[rec.id] ?? draftBreakdownValues[rec.id]?.totalValue ?? rec.totalValue;
+
+                    return (
+                      <div
+                        key={rec.id}
+                        onClick={() => setSelectedRecordId(rec.id)}
+                        className={`border-b border-neutral-800/80 p-3.5 cursor-pointer transition-colors flex items-start justify-between gap-3 text-xs ${
+                          isSelected
+                            ? 'bg-neutral-800/90 border-l-4 border-l-red-600'
+                            : isPending
+                            ? 'hover:bg-neutral-900 border-l-4 border-l-amber-500'
+                            : 'hover:bg-neutral-900/60'
+                        }`}
+                      >
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          <input
+                            type="checkbox"
+                            checked={checkedRecordIds.includes(rec.id)}
+                            onClick={event => event.stopPropagation()}
+                            onChange={() => toggleRecordChecked(rec.id)}
+                            className="mt-0.5 h-4 w-4 shrink-0 accent-red-600"
+                            aria-label={`Selecionar rota ${rec.originCity} para ${rec.destinationCity}, ${rec.vehicleType}`}
+                          />
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="font-extrabold text-white uppercase">
+                                {shownOrigin} → {shownDestination}
+                              </span>
+                              <span className="px-1.5 py-0.2 bg-neutral-800 text-neutral-300 font-mono text-[10px] rounded font-bold">
+                                {rec.destinationCode}
+                              </span>
+                              {rec.differential !== 'NORMAL' && rec.differential !== '-' && (
+                                <span className="px-1.5 py-0.2 bg-red-950 text-red-400 border border-red-800 text-[10px] rounded font-bold">
+                                  {rec.differential}
+                                </span>
+                              )}
+                            </div>
+
+                            <div className="flex items-center gap-3 text-[11px] text-neutral-400">
+                              <span className="font-semibold text-neutral-200">{shownVehicleType}</span>
+                              <span>·</span>
+                              <span className="font-mono text-white font-bold">{shownTotalValue}</span>
+                            </div>
+
+                            <p className="text-[10px] text-neutral-400 truncate flex items-center gap-1">
+                              <FileText className="w-3 h-3 text-neutral-400" />
+                              {rec.documentName} (Pág. {rec.pageNumber})
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-col items-end gap-1.5 shrink-0">
+                          <span
+                            className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                              rec.ocrConfidence >= 90
+                                ? 'bg-emerald-950 text-emerald-400'
+                                : rec.ocrConfidence >= 80
+                                ? 'bg-amber-950 text-amber-400'
+                                : 'bg-red-950 text-red-400'
+                            }`}
+                          >
+                            {rec.ocrConfidence}% OCR
+                          </span>
+
+                          <span
+                            className={`text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${
+                              rec.reviewStatus === 'REVISADO'
+                                ? 'bg-emerald-900/60 text-emerald-300'
+                                : rec.reviewStatus === 'AGUARDANDO CONFERÊNCIA'
+                                ? 'bg-amber-900/60 text-amber-300'
+                                : 'bg-neutral-800 text-neutral-300'
+                            }`}
+                          >
+                            {rec.reviewStatus}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              ))
             )}
           </div>
 
@@ -698,7 +938,10 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
                         <span className="mt-1 block text-[10px] text-emerald-200/50">Calculado após o desconto aplicado.</span>
                       </div>
                     </div>
-                    {selectedRecord.notes && <p className="mt-2 border-t border-neutral-800 pt-2 text-amber-300">{selectedRecord.notes}</p>}
+                    <div className="mt-2 space-y-1 border-t border-neutral-800 pt-2 text-amber-300">
+                      {selectedRecord.notes && <p>{selectedRecord.notes}</p>}
+                      <p>{calculationRuleMessage}</p>
+                    </div>
                   </section>
                 )}
 
@@ -707,7 +950,7 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
                   <div className="mb-4 flex items-center justify-between border-b border-neutral-800 pb-3">
                     <div>
                       <h4 className="text-xs font-bold uppercase tracking-wide text-neutral-200">Dados da rota</h4>
-                      <p className="mt-1 text-[10px] text-neutral-500">Enter aplica no formulário. Para gravar, use o botão Salvar.</p>
+                      <p className="mt-1 text-[10px] text-neutral-500">Pressione Enter para aplicar o valor na lista; aprove as rotas depois.</p>
                     </div>
                     <span className="rounded-full border border-neutral-700 bg-neutral-900 px-2 py-1 text-[10px] font-semibold text-neutral-400">Rascunho</span>
                   </div>
@@ -797,7 +1040,7 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
                     <label className="mb-1.5 block font-semibold text-neutral-400">Diferencial</label>
                     <select
                       value={editDifferential}
-                      onChange={e => setEditDifferential(e.target.value as Differential)}
+                      onChange={e => { void handleDifferentialChange(e.target.value as Differential); }}
                       className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2.5 font-bold text-white transition-colors focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500/30 cursor-pointer"
                     >
                       <option value="NORMAL">NORMAL</option>
@@ -812,13 +1055,16 @@ export const ReviewModal: React.FC<ReviewModalProps> = ({
                 {/* Save and confirm actions */}
                 <div className="pt-4 border-t border-neutral-800 flex items-center justify-end gap-3">
                   <button
-                    onClick={handleSaveSelected}
+                    type="button"
+                    onClick={() => { void handleSaveSelected(); }}
+                    disabled={savingRecord}
                     className="flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded font-bold text-xs transition-all shadow-md"
                   >
                     <Check className="w-4 h-4" />
-                    <span>Salvar e Marcar como Revisado</span>
+                    <span>{savingRecord ? 'Salvando…' : 'Salvar e Marcar como Revisado'}</span>
                   </button>
                 </div>
+                {saveError && <p role="alert" className="text-right text-xs text-red-400">{saveError}</p>}
               </>
             ) : (
               <div className="h-full flex items-center justify-center text-xs text-neutral-500">

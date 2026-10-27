@@ -9,6 +9,20 @@ import type { Differential } from './types.ts';
 
 const workerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'paddle_ocr_worker.py');
 const python312 = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python', 'Python312', 'python.exe');
+
+/** Repair UTF-8 filenames that Multer exposes as Latin-1 on some clients. */
+export function repairUtf8Mojibake(value: string): string {
+  if (!/Ã[\u0080-\u00BF]/.test(value)) return value;
+  const characters = Array.from(value);
+  if (characters.some(character => character.charCodeAt(0) > 0xFF)) return value;
+  try {
+    const bytes = Uint8Array.from(characters, character => character.charCodeAt(0));
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return value;
+  }
+}
+
 let paddleWorker: ChildProcessWithoutNullStreams | null = null;
 let paddleWorkerReady: Promise<ChildProcessWithoutNullStreams> | null = null;
 let paddleWorkerError = '';
@@ -30,7 +44,8 @@ export interface OcrDocumentContext {
 
 /** Shared PDF identification context sent to the local OCR workers. */
 export function buildOcrDocumentContext(filename: string): OcrDocumentContext {
-  const parts = filename.replace(/\.pdf$/i, '').split(/\s+x\s+|_x_|-x-/i)
+  const repairedFilename = repairUtf8Mojibake(filename);
+  const parts = repairedFilename.replace(/\.pdf$/i, '').split(/\s+x\s+|_x_|-x-/i)
     .map(part => part.replace(/[_-]+/g, ' ').replace(/\s*\([^)]*\)\s*$/, '').trim())
     .filter(Boolean);
   const cityCandidates = db.getCities().map(city => ({
@@ -163,6 +178,14 @@ function normalize(value: string): string {
   return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toUpperCase();
 }
 
+function cityIdentity(value: string): string {
+  return normalize(value)
+    .replace(/\b(?:DE|DO|DA|DOS|DAS)\b/g, ' ')
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function splitTables(markdown: string): string[][][] {
   const htmlRows = Array.from(markdown.matchAll(/<tr[^>]*>(.*?)<\/tr>/gis));
   if (htmlRows.length) {
@@ -221,16 +244,53 @@ function moneyValuesInCells(cells: string[]): string[] {
   return values;
 }
 
+function cityLookupTerms(cityName: string): string[] {
+  const normalizedName = normalize(cityName);
+  const parentheticalAliases = Array.from(cityName.matchAll(/\(([^)]*)\)/g))
+    .flatMap(([, aliases]) => aliases.split(/[\/,]/).map(normalize));
+  return [...new Set([normalizedName, ...parentheticalAliases])].filter(term => term.length >= 4);
+}
+
 function cityNearLabel(text: string, label: string): string | undefined {
   const normalizedText = normalize(text);
   const labelPosition = normalizedText.indexOf(label);
   if (labelPosition < 0) return undefined;
   const nearby = normalizedText.slice(labelPosition + label.length, labelPosition + label.length + 180);
   const cities = db.getCities().slice().sort((a, b) => b.name.length - a.name.length);
-  return cities.find(city => nearby.includes(normalize(city.name)))?.name;
+  return cities.find(city => cityLookupTerms(city.name).some(term => nearby.includes(term)))?.name;
+}
+
+function cityFromCodeNearLabel(text: string, label: string): string | undefined {
+  const normalizedText = normalize(text);
+  const labelPosition = normalizedText.indexOf(label);
+  if (labelPosition < 0) return undefined;
+  // Mercado Livre sheets often print the destination code beside the
+  // handwritten destination. That exact active code disambiguates cities
+  // with the same municipality name but different registered bases.
+  const nearby = normalizedText.slice(labelPosition + label.length, labelPosition + label.length + 140);
+  const codeMatches = db.getCities().flatMap(city => city.codes
+    .filter(code => code.active && code.code.trim())
+    .map(code => ({ city, code: normalize(code.code) })))
+    .sort((a, b) => b.code.length - a.code.length);
+  return codeMatches.find(({ code }) => {
+    const escapedCode = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^A-Z0-9])${escapedCode}([^A-Z0-9]|$)`).test(nearby);
+  })?.city.name;
+}
+
+function detectDifferential(text: string, filename: string): Differential {
+  const detect = (value: string): Differential | undefined => {
+    const normalized = normalize(value);
+    if (/\bC\s*\.?\s*P\s*\.?\s*L\b/.test(normalized)) return 'CPL';
+    if (/\bC\s*I\s*R\s*C\s*U\s*I\s*T\s*[O0]\b/.test(normalized)) return 'CIRCUITO';
+    if (/\bN\s*O\s*R\s*M\s*A\s*L\b/.test(normalized)) return 'NORMAL';
+    return undefined;
+  };
+  return detect(text) || detect(repairUtf8Mojibake(filename)) || 'NORMAL';
 }
 
 export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
+  const repairedFilename = repairUtf8Mojibake(filename);
   const markdown = pages.map(page => page.markdown).join('\n');
   const geometryRows = pages.flatMap(page => {
     const rows = page.rows || [];
@@ -246,13 +306,30 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
     return rows.map(row => ({ ...row, totalMinX: pageTotalMinX, alternateItems: page.alternateItems || [] }));
   });
   const plainText = markdown.replace(/<[^>]*>/g, ' ').replace(/\|/g, ' ').replace(/\s+/g, ' ');
-  const filenameCities = filename.replace(/\.pdf$/i, '').split(/\s+x\s+|_x_|-x-/i).map(part => part.replace(/[_-]+/g, ' ').replace(/\s*\([^)]*\)\s*$/, '').trim());
+  const filenameCities = repairedFilename.replace(/\.pdf$/i, '').split(/\s+x\s+|_x_|-x-/i).map(part => part.replace(/[_-]+/g, ' ').replace(/\s*\([^)]*\)\s*$/, '').trim());
   const cities = db.getCities().slice().sort((a, b) => b.name.length - a.name.length);
-  const originFromFilename = filenameCities[0]
-    ? cities
-      .filter(city => normalize(city.name) === normalize(filenameCities[0]) || normalize(city.name).startsWith(normalize(filenameCities[0])))
-      .sort((a, b) => a.name.length - b.name.length)[0]
-    : undefined;
+  const filenameOriginLabels = filenameCities[0]?.split(/\s+OU\s+/i).map(label => label.trim()).filter(Boolean) || [];
+  const filenameOriginCandidates = filenameOriginLabels.flatMap(label => {
+    const normalizedLabel = normalize(label);
+    const candidate = cities
+      .filter(city => {
+        const normalizedCity = normalize(city.name);
+        const baseName = normalizedCity.split(/\s*(?:\/|\()/, 1)[0].trim();
+        return normalizedCity === normalizedLabel
+          || normalizedCity.startsWith(`${normalizedLabel} (`)
+          || baseName === normalizedLabel
+          || cityLookupTerms(city.name).includes(normalizedLabel)
+          || cityIdentity(baseName) === cityIdentity(label);
+      })
+      .sort((a, b) => a.name.length - b.name.length)[0];
+    return candidate ? [candidate] : [];
+  }).filter((city, index, list) => list.findIndex(item => normalize(item.name) === normalize(city.name)) === index);
+  const originFromFilename = filenameOriginCandidates[0]
+    || (filenameCities[0]
+      ? cities
+        .filter(city => normalize(city.name) === normalize(filenameCities[0]) || normalize(city.name).startsWith(normalize(filenameCities[0])))
+        .sort((a, b) => a.name.length - b.name.length)[0]
+      : undefined);
   const originLabelPosition = normalize(plainText).indexOf('ORIGEM');
   const originLabelContext = originLabelPosition >= 0
     ? normalize(plainText).slice(originLabelPosition, originLabelPosition + 220)
@@ -262,29 +339,55 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
   // full base name when both parts are present in that field.
   const originIsPerusDistrict = originLabelContext.includes('PERUS') && originLabelContext.includes('SAO PAULO');
   const originFromText = cityNearLabel(plainText, 'ORIGEM') || cityNearLabel(plainText, 'ORIG:');
+  // Route filenames may explicitly list alternative origins with "ou".
+  // Match the recognized origin to one of those entries, then preserve the
+  // other registered origin so both route sets are created for review.
+  const originFromFilenameText = originFromText
+    ? filenameOriginCandidates.find(city => {
+      const cityBase = normalize(city.name).split(/\s*(?:\/|\()/, 1)[0].trim();
+      const textIdentity = cityIdentity(originFromText);
+      return normalize(city.name) === normalize(originFromText)
+        || cityBase === normalize(originFromText)
+        || (textIdentity.length >= 6 && cityIdentity(cityBase).startsWith(textIdentity));
+    })
+    : undefined;
+  const selectedFilenameOrigin = originFromFilenameText || originFromFilename;
   const filenameDestination = filenameCities.at(-1);
+  const destinationFromCode = cityFromCodeNearLabel(plainText, 'DESTINO');
   const destinationFromText = cityNearLabel(plainText, 'DESTINO');
   const originTextMatchesDestination = originFromText && (
     (destinationFromText && normalize(originFromText) === normalize(destinationFromText))
     || (filenameDestination && normalize(originFromText) === normalize(filenameDestination))
   );
-  const originCity = originTextMatchesDestination && originFromFilename
-    ? originFromFilename.name
+  const originCity = originTextMatchesDestination && selectedFilenameOrigin
+    ? selectedFilenameOrigin.name
     : originIsPerusDistrict
     ? 'SÃO PAULO (PERUS)'
-    : originFromText || originFromFilename?.name;
+    : originFromFilenameText?.name || originFromText || selectedFilenameOrigin?.name;
+  const secondaryOriginCity = filenameOriginCandidates
+    .find(city => normalize(city.name) !== normalize(originCity || ''))?.name;
   const exactFilenameDestination = filenameDestination
     ? cities.find(city => normalize(city.name) === normalize(filenameDestination))
     : undefined;
   // Freight filenames often use the municipality while the registered base has
   // a compound name such as "CITY / NEIGHBORING CITY" or "CITY (DISTRICT)".
   const filenameDestinationCandidates = filenameDestination
-    ? cities.filter(city => normalize(city.name).split(/\s*(?:\/|\()\s*/, 1)[0].trim() === normalize(filenameDestination))
+    ? cities.filter(city => {
+      const normalizedDestination = normalize(filenameDestination);
+      const baseName = normalize(city.name).split(/\s*(?:\/|\()/, 1)[0].trim();
+      return baseName === normalizedDestination
+        || cityLookupTerms(city.name).includes(normalizedDestination)
+        // Older route filenames sometimes use a different Portuguese
+        // preposition than the registered city (e.g. CACHOEIRO DO vs DE).
+        || cityIdentity(baseName) === cityIdentity(filenameDestination);
+    })
     : [];
-  const destinationCity = destinationFromText
+  const destinationCity = destinationFromCode
+    || destinationFromText
     || exactFilenameDestination?.name
     || filenameDestinationCandidates[0]?.name;
-  const destinationHintAmbiguous = !destinationFromText
+  const destinationHintAmbiguous = !destinationFromCode
+    && !destinationFromText
     && !exactFilenameDestination
     && filenameDestinationCandidates.length > 1;
   if (!originCity || !destinationCity) {
@@ -295,7 +398,10 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
   let priorityTariffTable = false;
   const profileLabels: Array<[RegExp, string]> = [
     [/\bBITREM\s*3/, 'BITREM 3º'], [/\bBITREM\b/, 'BITREM'],
+    [/\bTERCEIRO\s+CARRETA\b/, 'CARRETA 3º'], [/\bTERCEIRO\s+TRUCK\b/, 'TRUCK 3º'],
+    [/\bTERCEIRO\s+TOCO\b/, 'TOCO 3º'],
     [/\bCARRETA\s*CASA\b/, 'CARRETA CASA'], [/\bTRUCK\s*CASA\b/, 'TRUCK CASA'],
+    [/^(?:SO\s+)?CASA\b/, 'CARRETA CASA'], [/^(?:SO\s+)?AGREGADO\b/, 'CARRETA AGREGADO'],
     [/\bCARRETA.*(?:AGREGAD|REGAD)/, 'CARRETA AGREGADO'], [/\bCARRETA\s*3/, 'CARRETA 3º'],
     [/\bTRUCK\s*3/, 'TRUCK 3º'], [/\bTOCO\s*CASA\b/, 'TOCO CASA'], [/\bTOCO\s*3/, 'TOCO 3º'],
     [/\bMEDIO.*CASA\b/, 'MÉDIO (3/4 - CASA)'], [/\bMEDIO.*3/, 'MÉDIO (3/4 - 3º)'],
@@ -307,7 +413,12 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
   for (const table of splitTables(markdown)) {
     const headerIndex = table.findIndex(row => {
       const rowText = normalize(row.join(' '));
-      return rowText.includes('TOCO') && rowText.includes('VUC') && (rowText.includes('MEDIO') || rowText.includes('3/4'));
+      const hasToco = /\bTOCO\b/.test(rowText);
+      const hasOtherVehicleColumn = /\b(?:CARRETA|TRUCK|VUC)\b/.test(rowText)
+        || /\bMEDIO\b|\b3\/4\b/.test(rowText);
+      // Freight sheets vary: some have CARRETA/TRUCK/TOCO, others have
+      // TOCO/MÉDIO/VUC. Do not require all three CASA columns to be present.
+      return hasToco && hasOtherVehicleColumn;
     });
     if (headerIndex >= 0) {
       const header = table[headerIndex].map(normalize);
@@ -315,23 +426,33 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
       const tocoIndex = colIndex('TOCO');
       const medioIndex = Math.max(colIndex('MEDIO'), colIndex('3/4'));
       const vucIndex = colIndex('VUC');
+      const casaColumns = [
+        [3, tocoIndex, 'TOCO CASA'],
+        [4, medioIndex, 'MÉDIO (3/4 - CASA)'],
+        [5, vucIndex, 'VUC CASA']
+      ].filter(([, tableColumn]) => Number(tableColumn) >= 0) as Array<[number, number, string]>;
       const freightRow = table.find(row => /^FRETE\b/i.test(row[0] || ''));
       const tollRow = table.find(row => /PED.{0,2}GIO/i.test(normalize(row[0] || '')));
-      if (freightRow && tollRow && tocoIndex >= 0 && medioIndex >= 0 && vucIndex >= 0) {
+      if (freightRow && tollRow && casaColumns.length > 0) {
         priorityTariffTable = true;
         const freightValues = moneyValuesInCells(freightRow);
         const tollValues = moneyValuesInCells(tollRow);
-        const casaColumns = [[3, tocoIndex, 'TOCO CASA'], [4, medioIndex, 'MÉDIO (3/4 - CASA)'], [5, vucIndex, 'VUC CASA']] as const;
+        // Some OCR layouts omit the blank leading corner in the header row:
+        // "CARRETA | TRUCK | TOCO" but "FRETE PESO | value | value | value".
+        // Align tariff cells with the data rows so TOCO reads the third value,
+        // rather than accidentally taking TRUCK's second value.
+        const freightColumnOffset = Math.max(0, freightRow.length - header.length);
+        const tollColumnOffset = Math.max(0, tollRow.length - header.length);
         for (const [tariffPosition, tableColumn, vehicleType] of casaColumns) {
           // OCR engines sometimes merge several handwritten cells into one
           // detection box. When all six vehicle totals are recovered, preserve
           // their left-to-right order instead of indexing the merged cells.
           const freightWeightRaw = freightValues.length >= 6
             ? freightValues[tariffPosition]
-            : moneyIn(freightRow[tableColumn] || '');
+            : moneyIn(freightRow[tableColumn + freightColumnOffset] || '');
           const tollRaw = tollValues.length >= 6
             ? tollValues[tariffPosition]
-            : moneyIn(tollRow[tableColumn] || '');
+            : moneyIn(tollRow[tableColumn + tollColumnOffset] || '');
           records.push({ vehicleType, totalValueRaw: '-', numericValue: null, freightWeightRaw, tollRaw, hasFreightBreakdown: true, confidence: 45,
             notes: freightWeightRaw && tollRaw ? undefined : 'Valor manuscrito da tabela CASA não reconhecido com segurança; confira a imagem.' });
         }
@@ -340,9 +461,19 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
 
     for (const row of table) {
       const geometryRow = geometryRows[geometryRowIndex++];
-      const label = normalize(row[0] || '').replace(/#/g, '3');
+      // Paddle/RapidOCR can split a handwritten vehicle label into multiple
+      // adjacent detections (for example, "TERCEIRO" and "CARRETA"). Using
+      // only the first cell silently dropped those tariff rows, leaving just
+      // a label such as CASA that happened to be recognized as one box.
+      // Match against the complete OCR row; profile patterns are specific
+      // enough to ignore numeric fare cells and table headers.
+      const label = normalize(row.join(' ')).replace(/#/g, '3');
       const vehicleType = profileFor(label);
       if (!vehicleType) continue;
+      const rowHasFare = row.slice(1).some(cell => moneyIn(cell) !== null);
+      // "CARRETA CASA" is also printed as a section title above the actual
+      // lower table. It is not a tariff row unless it has cells with values.
+      if (vehicleType === 'CARRETA CASA' && label === 'CARRETA CASA' && !rowHasFare) continue;
       // When the TOTAL header is detected, select only numeric OCR boxes that
       // fall in that column. This excludes FRETE PESO and PEDÁGIO explicitly.
       let totalValueRaw: string | null = null;
@@ -411,13 +542,14 @@ export function parsePaddleMarkdown(pages: PaddlePage[], filename: string) {
 
   const origin = db.getCityByName(originCity);
   const normalizedText = normalize(plainText);
-  const differential: Differential = normalizedText.includes('CPL') ? 'CPL' : normalizedText.includes('CIRCUITO') ? 'CIRCUITO' : 'NORMAL';
+  const differential = detectDifferential(normalizedText, repairedFilename);
   return {
     client: /MERCADO\s+LIVRE/i.test(plainText) ? 'Mercado Livre' : db.getSettings().defaultClient,
     originCity,
     originState: originIsPerusDistrict ? 'SP' : origin?.state,
+    secondaryOriginCity,
     destinationCity,
-    destinationConfidence: destinationHintAmbiguous ? 35 : 45,
+    destinationConfidence: destinationFromCode ? 90 : destinationHintAmbiguous ? 35 : 45,
     destinationHintConflict: destinationHintAmbiguous,
     differential,
     priorityTariffTable,

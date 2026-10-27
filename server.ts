@@ -8,6 +8,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { db, UPLOADS_DIR } from './server/db.ts';
 import { processDocumentWithOCR, parseCurrencyInput } from './server/ocr.ts';
+import { repairUtf8Mojibake } from './server/paddleOcr.ts';
 import { generateRoutesExcel } from './server/excel.ts';
 import { createSampleTransportPdf } from './server/samplePdf.ts';
 import type { RouteRecord, UploadedDocument } from './server/types.ts';
@@ -147,6 +148,13 @@ app.post('/api/routes', (req, res) => {
       vehicleType: body.vehicleType,
       totalValue: formatted,
       numericValue: numeric,
+      ...(body.hasFreightBreakdown === true ? {
+        freightWeightValue: null,
+        tollValue: null,
+        receivableValue: null,
+        driverPaymentValue: null,
+        hasFreightBreakdown: true
+      } : {}),
       differential: body.differential || 'NORMAL',
       ocrConfidence: Number.isFinite(Number(body.ocrConfidence)) ? Number(body.ocrConfidence) : 100,
       reviewStatus: body.forcePendingReview === true
@@ -172,6 +180,11 @@ app.put('/api/routes/:id', (req, res) => {
       updates.totalValue = formatted;
       updates.numericValue = numeric;
     }
+    if (updates.driverPaymentValue !== undefined) {
+      updates.driverPaymentValue = updates.driverPaymentValue === null
+        ? null
+        : parseCurrencyInput(updates.driverPaymentValue).numeric;
+    }
     for (const field of ['freightWeightValue', 'tollValue'] as const) {
       if (updates[field] !== undefined) {
         updates[field] = updates[field] === null ? null : parseCurrencyInput(updates[field]).numeric;
@@ -185,7 +198,7 @@ app.put('/api/routes/:id', (req, res) => {
       const isThirdProfile = /3\s*(?:º|°|o)|TERCEIRO/i.test(vehicleType);
       const originState = String(updates.originState ?? existingRoute?.originState ?? '').toUpperCase();
       const paymentPercent = updates.driverPaymentPercent ?? existingRoute?.driverPaymentPercent ?? (originState === 'SP' ? 10 : originState ? 20 : undefined);
-      if (isBreakdown && !isThirdProfile && numeric != null && paymentPercent !== undefined) {
+      if (isBreakdown && !isThirdProfile && updates.driverPaymentValue === undefined && numeric != null && paymentPercent !== undefined) {
         const receivableCents = Math.round(numeric * 100);
         const paymentCents = Math.floor((receivableCents * (100 - paymentPercent) + 50) / 100);
         const payment = paymentCents / 100;
@@ -235,7 +248,26 @@ app.post('/api/routes/batch-approve', (req, res) => {
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'IDs devem ser uma lista não vazia' });
     }
-    const count = db.batchUpdateStatus(ids, 'REVISADO');
+    const requestedIds = [...new Set(ids.filter((id: unknown): id is string => typeof id === 'string'))];
+    const updates = Array.isArray(req.body.updates) ? req.body.updates : [];
+    for (const entry of updates) {
+      if (!entry || typeof entry.id !== 'string' || !requestedIds.includes(entry.id) || !entry.updates || typeof entry.updates !== 'object') continue;
+      const routeUpdates: Partial<RouteRecord> = { ...entry.updates };
+      if (routeUpdates.totalValue !== undefined) {
+        const { formatted, numeric } = parseCurrencyInput(routeUpdates.totalValue);
+        routeUpdates.totalValue = formatted;
+        routeUpdates.numericValue = numeric;
+      }
+      for (const field of ['driverPaymentValue', 'freightWeightValue', 'tollValue', 'receivableValue'] as const) {
+        if (routeUpdates[field] !== undefined) {
+          routeUpdates[field] = routeUpdates[field] === null
+            ? null
+            : parseCurrencyInput(routeUpdates[field]).numeric;
+        }
+      }
+      db.updateRouteRecord(entry.id, routeUpdates);
+    }
+    const count = db.batchUpdateStatus(requestedIds, 'REVISADO');
     res.json({ success: true, count });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -274,6 +306,7 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
     const results: any[] = [];
 
     for (const file of files) {
+      const filename = repairUtf8Mojibake(file.originalname);
       // 1. Calculate file hash for idempotency
       const fileHash = crypto.createHash('sha256').update(file.buffer).digest('hex');
 
@@ -283,7 +316,7 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
       const isProcessingNow = processingFileHashes.has(fileHash) || Boolean(existingDoc && processingDocumentIds.has(existingDoc.id));
       if (existingDoc && !req.query.force && existingRoutes.length > 0) {
         results.push({
-          filename: file.originalname,
+          filename,
           status: 'DUPLICATE',
           message: 'Este arquivo já possui rotas salvas. Nenhuma cópia foi criada.',
           documentId: existingDoc.id,
@@ -293,7 +326,7 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
       }
       if (existingDoc && isProcessingNow) {
         results.push({
-          filename: file.originalname,
+          filename,
           status: 'PROCESSING',
           message: 'Este arquivo já está sendo processado nesta sessão.',
           documentId: existingDoc.id
@@ -306,14 +339,14 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
       const docId = retryExistingDocument
         ? existingDoc!.id
         : `doc-${crypto.randomBytes(6).toString('hex')}`;
-      const safeFilename = `${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+      const safeFilename = `${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
       const storagePath = path.join(UPLOADS_DIR, safeFilename);
       fs.writeFileSync(storagePath, file.buffer);
 
       // 4. Create document record
       const docRecord: UploadedDocument = {
         id: docId,
-        filename: file.originalname,
+        filename,
         fileHash,
         fileSize: file.size,
         storagePath: `storage/uploads/${safeFilename}`,
@@ -334,7 +367,7 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
         const extractedRoutes = await processDocumentWithOCR(
           file.buffer,
           file.mimetype || 'application/pdf',
-          file.originalname,
+          filename,
           docId
         );
 
@@ -347,13 +380,13 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
 
         results.push({
           documentId: docId,
-          filename: file.originalname,
+          filename,
           status: 'SUCCESS',
           originCity: extractedRoutes[0]?.originCity,
           recordsExtracted: extractedRoutes.length
         });
       } catch (procErr: any) {
-        console.error(`Error processing file ${file.originalname}:`, procErr);
+        console.error(`Error processing file ${filename}:`, procErr);
         db.updateDocument(docId, {
           processingStatus: 'ERROR',
           errorMessage: procErr.message || 'Erro no processamento OCR',
@@ -361,7 +394,7 @@ app.post('/api/documents/upload', upload.array('files'), async (req, res) => {
         });
         results.push({
           documentId: docId,
-          filename: file.originalname,
+          filename,
           status: 'ERROR',
           error: procErr.message
         });
@@ -385,7 +418,8 @@ app.post('/api/documents/:id/reprocess', async (req, res) => {
   try {
     const doc = db.getDocumentById(req.params.id);
     if (!doc) return res.status(404).json({ error: 'Documento não encontrado' });
-    processingDoc = doc;
+    const filename = repairUtf8Mojibake(doc.filename);
+    processingDoc = { ...doc, filename };
     if (processingDocumentIds.has(doc.id)) {
       return res.status(409).json({ error: 'Este documento já está sendo processado. Aguarde a conclusão.' });
     }
@@ -403,7 +437,7 @@ app.post('/api/documents/:id/reprocess', async (req, res) => {
     const routes = await processDocumentWithOCR(
       fileBuffer,
       'application/pdf',
-      doc.filename,
+      filename,
       doc.id
     );
 
@@ -412,6 +446,7 @@ app.post('/api/documents/:id/reprocess', async (req, res) => {
     db.removeDocumentRoutesExcept(doc.id, routes.map(route => route.id));
 
     db.updateDocument(doc.id, {
+      filename,
       processingStatus: 'COMPLETED',
       totalRecordsExtracted: routes.length,
       processedAt: new Date().toISOString()
@@ -421,6 +456,7 @@ app.post('/api/documents/:id/reprocess', async (req, res) => {
   } catch (err: any) {
     if (processingDoc) {
       db.updateDocument(processingDoc.id, {
+        filename: processingDoc.filename,
         processingStatus: 'ERROR',
         errorMessage: err.message || 'Erro no reprocessamento OCR',
         processedAt: new Date().toISOString()
